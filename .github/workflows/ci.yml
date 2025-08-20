@@ -26,5 +26,9 @@ jobs:
       - name: Run Checkstyle
         run: mvn checkstyle:check
 
-      - name: Run SonarQube Analysis
-        run: mvn sonar:sonar -Dsonar.projectKey=CI-Test -Dsonar.host.url=http://localhost:9000 -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+      - name: SonarCloud Scan
+        run: mvn sonar:sonar \
+          -Dsonar.projectKey=mohamedAtef2002_CI-Test \
+          -Dsonar.organization=mohamedatef2002 \
+          -Dsonar.host.url=https://sonarcloud.io \
+          -Dsonar.login=${{ secrets.SONAR_TOKEN }}
