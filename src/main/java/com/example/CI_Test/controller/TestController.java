@@ -6,7 +6,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping
-public class testController {
+public class TestController {
 
     @GetMapping("/hello")
     public String sayHello() {
