@@ -81,6 +81,7 @@ jobs:
         run: mvn clean install
 
       - name: Analyze with CodeQL
+        if: github.event.pull_request.head.repo.fork == false
         uses: github/codeql-action/analyze@v3
 
   # Job 3: Unit Tests (runs after code-quality)
