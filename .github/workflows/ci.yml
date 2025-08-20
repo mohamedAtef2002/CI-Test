@@ -14,10 +14,9 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Job 1: Build & Unit Tests with Coverage
-  build-and-test:
+  # Job 1: Build Project
+  build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -36,34 +35,13 @@ jobs:
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2
 
-      - name: Build and run unit tests
-        run: mvn clean verify -Dmaven.test.failure.ignore=false
+      - name: Build project
+        run: mvn clean compile -DskipTests
 
-      - name: Generate JaCoCo coverage report
-        run: mvn jacoco:report
-
-      - name: Upload test & coverage results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-and-coverage-results
-          path: |
-            target/surefire-reports/
-            target/site/jacoco/
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          file: target/site/jacoco/jacoco.xml
-          flags: unittests
-          name: codecov-umbrella
-
-  # Job 2: Static Analysis (SonarCloud + CodeQL)
-  static-analysis:
+  # Job 2: Code Quality Scan (runs after build)
+  code-quality:
     runs-on: ubuntu-latest
-    needs: build-and-test
-
+    needs: build
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -100,11 +78,48 @@ jobs:
       - name: Analyze with CodeQL
         uses: github/codeql-action/analyze@v3
 
-  # Job 3: Docker Build & Push
+  # Job 3: Unit Tests (runs after code-quality)
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run unit tests
+        run: mvn test
+
+      - name: Generate JaCoCo coverage report
+        run: mvn jacoco:report
+
+      - name: Upload test & coverage results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-and-coverage-results
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: target/site/jacoco/jacoco.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  # Job 4: Docker Build & Push (runs after unit tests)
   docker-build:
     runs-on: ubuntu-latest
-    needs: [build-and-test]
-
+    needs: unit-tests
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
