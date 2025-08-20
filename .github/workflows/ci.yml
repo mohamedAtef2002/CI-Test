@@ -20,6 +20,11 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Build with Maven
-        run: mvn clean install --batch-mode
+      - name: Build and Run Tests
+        run: mvn clean verify --batch-mode
 
+      - name: Run Checkstyle
+        run: mvn checkstyle:check
+
+      - name: Run SonarQube Analysis
+        run: mvn sonar:sonar -Dsonar.projectKey=CI-Test -Dsonar.host.url=http://localhost:9000 -Dsonar.login=${{ secrets.SONAR_TOKEN }}
