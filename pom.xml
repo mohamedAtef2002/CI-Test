@@ -137,15 +137,7 @@
                 <groupId>org.owasp</groupId>
                 <artifactId>dependency-check-maven</artifactId>
                 <version>9.0.9</version>
-                <configuration>
-                    <formats>
-                        <format>HTML</format>
-                        <format>XML</format>
-                    </formats>
-                    <outputDirectory>${project.build.directory}</outputDirectory>
-                </configuration>
             </plugin>
-
 
         </plugins>
 	</build>
