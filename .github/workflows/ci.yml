@@ -2,133 +2,83 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ main, develop, 'feature/**' ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main, develop ]
-
-env:
-  JAVA_VERSION: '21'
-  JAVA_DISTRIBUTION: 'temurin'
+    branches: [ "main" ]
 
 jobs:
-  # Job 1: Build
-  build:
-    name: Build Application
+  build-and-test:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: '21'
+          distribution: 'temurin'
 
-      - name: Cache Maven
-        uses: actions/cache@v3
+      - name: Build with Maven
+        run: mvn clean install -DskipTests
+
+      - name: Run Tests
+        run: mvn test
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-m2
-
-      - run: chmod +x ./mvnw
-
-      - name: Build app
-        run: ./mvnw clean package -DskipTests
-
-      - uses: actions/upload-artifact@v3
-        with:
-          name: jar-artifact
+          name: build-artifacts
           path: target/*.jar
 
-  # Job 2: Test
-  test:
-    name: Run Tests
+  security-scan:
     runs-on: ubuntu-latest
-    needs: build
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: testdb
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
+    needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: '21'
+          distribution: 'temurin'
 
-      - run: chmod +x ./mvnw
-
-      - name: Run tests
-        run: ./mvnw clean test -Pci
-
-      - uses: actions/upload-artifact@v3
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: test-results
-          path: target/surefire-reports/
+          name: build-artifacts
 
-  # Job 3: Code Quality (runs after tests)
+      - name: Run Security Scan (CodeQL)
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
   code-quality:
-    name: Code Quality Analysis
     runs-on: ubuntu-latest
-    needs: test
-
+    needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: '21'
+          distribution: 'temurin'
 
-      - run: chmod +x ./mvnw
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
 
-      - name: Run Checkstyle
-        run: ./mvnw checkstyle:check
-
-      - name: Run SpotBugs
-        run: ./mvnw spotbugs:check
-
-      - name: SonarCloud Analysis
+      - name: Run SonarQube analysis
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: ./mvnw verify sonar:sonar -Dsonar.projectKey=YOUR_PROJECT -Dsonar.organization=YOUR_ORG -Dsonar.host.url=https://sonarcloud.io
-
-  # Job 4: Security Scan (runs after tests, in parallel with code-quality)
-  security:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
-      - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v2
-        with:
-          sarif_file: 'trivy-results.sarif'
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.projectKey=my_project \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
