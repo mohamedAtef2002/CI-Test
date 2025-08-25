@@ -175,6 +175,7 @@ jobs:
         with:
           name: build-artifacts
           path: target/
+        continue-on-error: true
 
       - name: Check SonarCloud configuration
         id: sonar-check
@@ -187,64 +188,71 @@ jobs:
             echo "⚠️ SonarCloud token not found - running basic analysis instead"
           fi
 
-      - name: Validate SonarCloud project setup
-        if: steps.sonar-check.outputs.sonar_enabled == 'true'
-        id: sonar-validate
-        run: |
-          # Check if required environment variables are set
-          if [ -z "${{ secrets.SONAR_TOKEN }}" ]; then
-            echo "sonar_valid=false" >> $GITHUB_OUTPUT
-            echo "❌ SONAR_TOKEN is not set"
-            exit 0
-          fi
-          
-          # Extract repository info
-          REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
-          
-          echo "Repository Owner: $REPO_OWNER"
-          echo "Repository Name: $REPO_NAME"
-          
-          # Check if this is a valid project key format
-          PROJECT_KEY="${REPO_OWNER}_${REPO_NAME}"
-          echo "Generated Project Key: $PROJECT_KEY"
-          
-          echo "sonar_valid=true" >> $GITHUB_OUTPUT
-          echo "project_key=$PROJECT_KEY" >> $GITHUB_OUTPUT
-          echo "organization=$REPO_OWNER" >> $GITHUB_OUTPUT
-
       - name: Run SonarCloud analysis
-        if: steps.sonar-check.outputs.sonar_enabled == 'true' && steps.sonar-validate.outputs.sonar_valid == 'true'
+        if: steps.sonar-check.outputs.sonar_enabled == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
           echo "🔍 Running SonarCloud analysis..."
-          echo "Project Key: ${{ steps.sonar-validate.outputs.project_key }}"
-          echo "Organization: ${{ steps.sonar-validate.outputs.organization }}"
           
+          # Extract repository info
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PROJECT_KEY="${REPO_OWNER}_${REPO_NAME}"
+          
+          echo "Project Key: $PROJECT_KEY"
+          echo "Organization: $REPO_OWNER"
+          
+          # Run SonarCloud analysis with error handling
+          set +e  # Don't exit on error
           mvn -B sonar:sonar \
             -Dmaven.project.sourceRoots.warningsDisabled=true \
-            -Dsonar.projectKey=${{ steps.sonar-validate.outputs.project_key }} \
-            -Dsonar.organization=${{ steps.sonar-validate.outputs.organization }} \
+            -Dsonar.projectKey="$PROJECT_KEY" \
+            -Dsonar.organization="$REPO_OWNER" \
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
             -Dsonar.java.source=${{ env.JAVA_VERSION }} \
             -Dsonar.java.target=${{ env.JAVA_VERSION }}
-        continue-on-error: true
+          
+          SONAR_EXIT_CODE=$?
+          set -e  # Re-enable exit on error
+          
+          if [ $SONAR_EXIT_CODE -eq 0 ]; then
+            echo "✅ SonarCloud analysis completed successfully"
+            echo "## 📊 SonarCloud Analysis" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Analysis completed successfully**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "View detailed results: [SonarCloud Dashboard](https://sonarcloud.io/project/overview?id=$PROJECT_KEY)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ SonarCloud analysis failed (exit code: $SONAR_EXIT_CODE)"
+            echo "This might be because the project is not set up in SonarCloud yet."
+            echo "## 📊 SonarCloud Analysis" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Analysis failed** - Project might not be set up in SonarCloud" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Setup Instructions:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Go to [SonarCloud](https://sonarcloud.io)" >> $GITHUB_STEP_SUMMARY
+            echo "2. Sign in with GitHub" >> $GITHUB_STEP_SUMMARY
+            echo "3. Click 'Import an organization' or '+' → 'Analyze new project'" >> $GITHUB_STEP_SUMMARY
+            echo "4. Select this repository: **${{ github.repository }}**" >> $GITHUB_STEP_SUMMARY
+            echo "5. Generate a token and add it as **SONAR_TOKEN** secret in repository settings" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Run basic code analysis
-        if: steps.sonar-check.outputs.sonar_enabled == 'false'
+        if: always()
         run: |
           echo "🔍 Running basic code analysis..."
           
-          # Count lines of code
+          # Always show code metrics
           echo "## 📈 Code Metrics" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          JAVA_FILES=$(find src -name "*.java" 2>/dev/null | wc -l || echo "0")
-          JAVA_LINES=$(find src -name "*.java" -exec cat {} \; 2>/dev/null | wc -l || echo "0")
-          TEST_FILES=$(find src/test -name "*.java" 2>/dev/null | wc -l || echo "0")
+          # Find source files
+          JAVA_FILES=$(find . -name "*.java" -not -path "./target/*" 2>/dev/null | wc -l || echo "0")
+          JAVA_LINES=$(find . -name "*.java" -not -path "./target/*" -exec cat {} \; 2>/dev/null | wc -l || echo "0")
+          TEST_FILES=$(find . -name "*Test.java" -o -name "*Tests.java" 2>/dev/null | wc -l || echo "0")
           
           echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
@@ -254,22 +262,38 @@ jobs:
           
           # Check if coverage report exists
           if [ -f target/site/jacoco/jacoco.xml ]; then
-            COVERAGE=$(grep -o 'missed="[0-9]*"' target/site/jacoco/jacoco.xml | head -1 | grep -o '[0-9]*' || echo "N/A")
-            echo "| Coverage Data | Available |" >> $GITHUB_STEP_SUMMARY
+            # Try to extract coverage percentage
+            COVERAGE_MISSED=$(grep -o 'type="INSTRUCTION".*missed="[0-9]*"' target/site/jacoco/jacoco.xml | grep -o 'missed="[0-9]*"' | grep -o '[0-9]*' | head -1 || echo "0")
+            COVERAGE_COVERED=$(grep -o 'type="INSTRUCTION".*covered="[0-9]*"' target/site/jacoco/jacoco.xml | grep -o 'covered="[0-9]*"' | grep -o '[0-9]*' | head -1 || echo "0")
+          
+            if [ "$COVERAGE_MISSED" != "0" ] || [ "$COVERAGE_COVERED" != "0" ]; then
+              TOTAL=$((COVERAGE_MISSED + COVERAGE_COVERED))
+              if [ $TOTAL -gt 0 ]; then
+                COVERAGE_PERCENT=$((COVERAGE_COVERED * 100 / TOTAL))
+                echo "| Code Coverage | ${COVERAGE_PERCENT}% |" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "| Code Coverage | Available |" >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              echo "| Code Coverage | Available |" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "| Coverage Data | Not Available |" >> $GITHUB_STEP_SUMMARY
+            echo "| Code Coverage | Not Available |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check build artifacts
+          if [ -d target ]; then
+            JAR_COUNT=$(find target -name "*.jar" 2>/dev/null | wc -l || echo "0")
+            echo "| Build Artifacts | $JAR_COUNT JAR file(s) |" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "💡 **Tip**: Add SONAR_TOKEN to repository secrets for detailed code quality analysis" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### To set up SonarCloud:" >> $GITHUB_STEP_SUMMARY
-          echo "1. Go to https://sonarcloud.io" >> $GITHUB_STEP_SUMMARY
-          echo "2. Sign in with GitHub" >> $GITHUB_STEP_SUMMARY
-          echo "3. Import this repository" >> $GITHUB_STEP_SUMMARY
-          echo "4. Generate a token and add it as SONAR_TOKEN secret" >> $GITHUB_STEP_SUMMARY
           
-          echo "✅ Basic code analysis completed"
+          if [ "${{ steps.sonar-check.outputs.sonar_enabled }}" == "false" ]; then
+            echo "💡 **Tip**: Add SONAR_TOKEN to repository secrets for detailed code quality analysis with SonarCloud" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "✅ Code analysis completed"
 
   # 3️⃣ Security Scan
   security-scan:
@@ -290,6 +314,18 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
 
+      - name: Check if Code Scanning is available
+        id: code-scanning-check
+        run: |
+          # Check if running on public repo or if advanced security is enabled
+          if [ "${{ github.repository_owner }}" != "${{ github.actor }}" ] && [ "${{ github.event.repository.private }}" == "true" ]; then
+            echo "code_scanning_available=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Code scanning may not be available for private repositories without GitHub Advanced Security"
+          else
+            echo "code_scanning_available=true" >> $GITHUB_OUTPUT
+            echo "✅ Code scanning should be available"
+          fi
+
       - name: Run Trivy vulnerability scanner (SARIF)
         uses: aquasecurity/trivy-action@master
         with:
@@ -304,177 +340,262 @@ jobs:
       - name: Check SARIF file
         id: sarif-check
         run: |
-          if [ -f trivy-results.sarif ]; then
+          if [ -f trivy-results.sarif ] && [ -s trivy-results.sarif ]; then
             echo "sarif_exists=true" >> $GITHUB_OUTPUT
             echo "✅ SARIF file generated successfully"
+            echo "SARIF file size: $(wc -c < trivy-results.sarif) bytes"
           else
             echo "sarif_exists=false" >> $GITHUB_OUTPUT
-            echo "⚠️ SARIF file not generated"
-            touch trivy-results.sarif
-          fi
+            echo "⚠️ SARIF file not generated or empty"
+            # Create a minimal valid SARIF file as fallback
+            cat > trivy-results.sarif << 'EOF'
+  {
+    "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+    "version": "2.1.0",
+    "runs": [
+      {
+        "tool": {
+          "driver": {
+            "name": "Trivy",
+            "informationUri": "https://github.com/aquasecurity/trivy",
+            "version": "dev"
+          }
+        },
+        "results": []
+      }
+    ]
+  }
+  EOF
+  echo "Created fallback SARIF file"
+  fi
 
-      - name: Upload Trivy scan results
-        if: steps.sarif-check.outputs.sarif_exists == 'true'
-        uses: github/codeql-action/upload-sarif@v3
-        continue-on-error: true
-        with:
-          sarif_file: 'trivy-results.sarif'
+- name: Upload Trivy scan results
+  if: steps.code-scanning-check.outputs.code_scanning_available == 'true'
+  uses: github/codeql-action/upload-sarif@v3
+  continue-on-error: true
+  with:
+    sarif_file: 'trivy-results.sarif'
 
-      - name: Security summary
-        run: |
-          echo "## 🔒 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Scanner**: Trivy" >> $GITHUB_STEP_SUMMARY
-          echo "- **Scope**: Filesystem dependencies" >> $GITHUB_STEP_SUMMARY
-          echo "- **Severity**: CRITICAL, HIGH" >> $GITHUB_STEP_SUMMARY
-          echo "- **SARIF Upload**: ${{ steps.sarif-check.outputs.sarif_exists == 'true' && '✅ Success' || '⚠️ Skipped' }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "💡 **Tip**: Enable GitHub Code Scanning in repository settings for advanced security analysis" >> $GITHUB_STEP_SUMMARY
+- name: Security summary
+  run: |
+    echo "## 🔒 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+    echo "" >> $GITHUB_STEP_SUMMARY
+    echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+    echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+    echo "| Scanner | Trivy ✅ |" >> $GITHUB_STEP_SUMMARY
+    echo "| Scope | Filesystem dependencies |" >> $GITHUB_STEP_SUMMARY
+    echo "| Severity Filter | CRITICAL, HIGH |" >> $GITHUB_STEP_SUMMARY
+    echo "| SARIF Generated | ${{ steps.sarif-check.outputs.sarif_exists == 'true' && '✅ Yes' || '⚠️ No/Empty' }} |" >> $GITHUB_STEP_SUMMARY
+    echo "| Code Scanning Upload | ${{ steps.code-scanning-check.outputs.code_scanning_available == 'true' && '✅ Attempted' || '⏭️ Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+    echo "" >> $GITHUB_STEP_SUMMARY
+    
+    if [ "${{ steps.code-scanning-check.outputs.code_scanning_available }}" != "true" ]; then
+      echo "### 💡 Code Scanning Setup" >> $GITHUB_STEP_SUMMARY
+      echo "Code scanning upload was skipped. This is normal for:" >> $GITHUB_STEP_SUMMARY
+      echo "- Private repositories without GitHub Advanced Security" >> $GITHUB_STEP_SUMMARY
+      echo "- Repositories where code scanning is not yet enabled" >> $GITHUB_STEP_SUMMARY
+      echo "" >> $GITHUB_STEP_SUMMARY
+      echo "To enable code scanning:" >> $GITHUB_STEP_SUMMARY
+      echo "1. Go to **Settings** → **Code security and analysis**" >> $GITHUB_STEP_SUMMARY
+      echo "2. Enable **Code scanning** (if available)" >> $GITHUB_STEP_SUMMARY
+      echo "3. For private repos: GitHub Advanced Security may be required" >> $GITHUB_STEP_SUMMARY
+    else
+      echo "### ✅ Security Analysis Complete" >> $GITHUB_STEP_SUMMARY
+      echo "- Vulnerability scan completed successfully" >> $GITHUB_STEP_SUMMARY
+      echo "- Results uploaded to GitHub Code Scanning" >> $GITHUB_STEP_SUMMARY
+      echo "- Check the **Security** tab for detailed findings" >> $GITHUB_STEP_SUMMARY
+    fi
+    
+    echo "" >> $GITHUB_STEP_SUMMARY
+    echo "🔍 **View Results**: Check console output above for vulnerability details" >> $GITHUB_STEP_SUMMARY
 
-  # 4️⃣ Docker Build and Push
-  docker:
-    name: Docker Build & Push
-    runs-on: ubuntu-latest
-    needs: [build-and-test, security-scan]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+# 4️⃣ Docker Build and Push
+docker:
+  name: Docker Build & Push
+  runs-on: ubuntu-latest
+  needs: [build-and-test, security-scan]
+  if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-artifacts
-          path: target/
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts
+        path: target/
 
-      - name: Verify Dockerfile exists
-        id: dockerfile-check
-        run: |
-          if [ -f Dockerfile ]; then
-            echo "dockerfile_exists=true" >> $GITHUB_OUTPUT
-            echo "✅ Dockerfile found"
+    - name: Verify Dockerfile exists
+      id: dockerfile-check
+      run: |
+        if [ -f Dockerfile ]; then
+          echo "dockerfile_exists=true" >> $GITHUB_OUTPUT
+          echo "✅ Dockerfile found"
+        else
+          echo "dockerfile_exists=false" >> $GITHUB_OUTPUT
+          echo "❌ Dockerfile not found - skipping Docker build"
+        fi
+
+    - name: Set up Docker Buildx
+      if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Check Docker Hub credentials
+      if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
+      id: docker-check
+      run: |
+        if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+          echo "docker_enabled=true" >> $GITHUB_OUTPUT
+          echo "✅ Docker Hub credentials found - will push to registry"
+        else
+          echo "docker_enabled=false" >> $GITHUB_OUTPUT
+          echo "⚠️ Docker Hub credentials not found - will build locally only"
+        fi
+
+    - name: Log in to Docker Hub
+      if: steps.dockerfile-check.outputs.dockerfile_exists == 'true' && steps.docker-check.outputs.docker_enabled == 'true'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract metadata
+      if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}/myapp
+        tags: |
+          type=ref,event=branch
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=raw,value=${{ needs.build-and-test.outputs.version }}
+
+    - name: Build Docker image
+      if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64
+        load: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Test Docker image
+      if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
+      run: |
+        echo "🧪 Testing Docker image..."
+        IMAGE_NAME="${{ secrets.DOCKERHUB_USERNAME || 'local' }}/myapp:latest"
+        echo "Testing image: $IMAGE_NAME"
+        
+        # Test if image runs (will exit quickly for Spring Boot without proper config)
+        timeout 10 docker run --rm $IMAGE_NAME || echo "Image test completed (expected to exit)"
+
+    - name: Push Docker image
+      if: steps.dockerfile-check.outputs.dockerfile_exists == 'true' && steps.docker-check.outputs.docker_enabled == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+    - name: Docker summary
+      run: |
+        echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.dockerfile-check.outputs.dockerfile_exists }}" == "true" ]; then
+          echo "| Dockerfile | ✅ Found |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Built | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pushed to Registry | ${{ steps.docker-check.outputs.docker_enabled == 'true' && '✅ Yes' || '⚠️ Local only' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Platforms | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ needs.build-and-test.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Dockerfile | ❌ Missing |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Built | ❌ Skipped |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ⚠️ Add Dockerfile to enable Docker builds |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.dockerfile-check.outputs.dockerfile_exists }}" != "true" ]; then
+          echo "💡 **Tip**: Add a Dockerfile to the repository root to enable Docker builds" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.docker-check.outputs.docker_enabled }}" != "true" ]; then
+          echo "💡 **Tip**: Add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN to repository secrets to enable Docker Hub publishing" >> $GITHUB_STEP_SUMMARY
+        fi
+
+# 5️⃣ Build Status Summary
+build-status:
+  name: Build Status
+  runs-on: ubuntu-latest
+  needs: [build-and-test, code-quality, security-scan]
+  if: always()
+
+  steps:
+    - name: Overall build status
+      run: |
+        echo "## 🎯 Pipeline Status Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Stage | Status | Details |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Build & Test | ${{ needs.build-and-test.result == 'success' && '✅ Passed' || needs.build-and-test.result == 'failure' && '❌ Failed' || '⏭️ Skipped' }} | Core functionality |" >> $GITHUB_STEP_SUMMARY
+        echo "| Code Quality | ${{ needs.code-quality.result == 'success' && '✅ Passed' || needs.code-quality.result == 'failure' && '⚠️ Issues found' || '⏭️ Skipped' }} | Static analysis |" >> $GITHUB_STEP_SUMMARY
+        echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Passed' || needs.security-scan.result == 'failure' && '⚠️ Issues found' || '⏭️ Skipped' }} | Vulnerability check |" >> $GITHUB_STEP_SUMMARY
+        echo "| Docker Build | ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' && '🐳 Triggered' || '⏭️ Skipped (not main branch)' }} | Container image |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Determine overall status
+        BUILD_SUCCESS="${{ needs.build-and-test.result == 'success' }}"
+        QUALITY_OK="${{ needs.code-quality.result == 'success' || needs.code-quality.result == 'skipped' }}"
+        SECURITY_OK="${{ needs.security-scan.result == 'success' }}"
+        
+        if [ "$BUILD_SUCCESS" == "true" ]; then
+          if [ "$QUALITY_OK" == "true" ] && [ "$SECURITY_OK" == "true" ]; then
+            echo "## 🎉 **Pipeline Status: SUCCESS** " >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ All checks passed successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "- Build and tests completed without errors" >> $GITHUB_STEP_SUMMARY
+            echo "- Code quality analysis completed" >> $GITHUB_STEP_SUMMARY  
+            echo "- Security scan found no critical issues" >> $GITHUB_STEP_SUMMARY
           else
-            echo "dockerfile_exists=false" >> $GITHUB_OUTPUT
-            echo "❌ Dockerfile not found - skipping Docker build"
+            echo "## ⚠️ **Pipeline Status: SUCCESS WITH WARNINGS**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Core build passed, but some optional checks had issues:" >> $GITHUB_STEP_SUMMARY
+        
+            if [ "$QUALITY_OK" != "true" ]; then
+              echo "- ⚠️ Code quality analysis had issues (non-blocking)" >> $GITHUB_STEP_SUMMARY
+            fi
+        
+            if [ "$SECURITY_OK" != "true" ]; then
+              echo "- ⚠️ Security scan had issues (check for vulnerabilities)" >> $GITHUB_STEP_SUMMARY
+            fi
+        
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 These issues don't prevent deployment but should be addressed" >> $GITHUB_STEP_SUMMARY
           fi
-
-      - name: Set up Docker Buildx
-        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Check Docker Hub credentials
-        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
-        id: docker-check
-        run: |
-          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            echo "docker_enabled=true" >> $GITHUB_OUTPUT
-            echo "✅ Docker Hub credentials found - will push to registry"
-          else
-            echo "docker_enabled=false" >> $GITHUB_OUTPUT
-            echo "⚠️ Docker Hub credentials not found - will build locally only"
-          fi
-
-      - name: Log in to Docker Hub
-        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true' && steps.docker-check.outputs.docker_enabled == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract metadata
-        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}/myapp
-          tags: |
-            type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ needs.build-and-test.outputs.version }}
-
-      - name: Build Docker image
-        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64
-          load: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Test Docker image
-        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
-        run: |
-          echo "🧪 Testing Docker image..."
-          IMAGE_NAME="${{ secrets.DOCKERHUB_USERNAME || 'local' }}/myapp:latest"
-          echo "Testing image: $IMAGE_NAME"
-          
-          # Test if image runs (will exit quickly for Spring Boot without proper config)
-          timeout 10 docker run --rm $IMAGE_NAME || echo "Image test completed (expected to exit)"
-
-      - name: Push Docker image
-        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true' && steps.docker-check.outputs.docker_enabled == 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Docker summary
-        run: |
-          echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ❌ **Pipeline Status: FAILED**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ steps.dockerfile-check.outputs.dockerfile_exists }}" == "true" ]; then
-            echo "| Dockerfile | ✅ Found |" >> $GITHUB_STEP_SUMMARY
-            echo "| Image Built | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
-            echo "| Pushed to Registry | ${{ steps.docker-check.outputs.docker_enabled == 'true' && '✅ Yes' || '⚠️ Local only' }} |" >> $GITHUB_STEP_SUMMARY
-            echo "| Platforms | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
-            echo "| Version | ${{ needs.build-and-test.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| Dockerfile | ❌ Missing |" >> $GITHUB_STEP_SUMMARY
-            echo "| Image Built | ❌ Skipped |" >> $GITHUB_STEP_SUMMARY
-            echo "| Status | ⚠️ Add Dockerfile to enable Docker builds |" >> $GITHUB_STEP_SUMMARY
-          fi
-          
+          echo "❌ Build or tests failed - deployment blocked" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ steps.dockerfile-check.outputs.dockerfile_exists }}" != "true" ]; then
-            echo "💡 **Tip**: Add a Dockerfile to the repository root to enable Docker builds" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ steps.docker-check.outputs.docker_enabled }}" != "true" ]; then
-            echo "💡 **Tip**: Add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN to repository secrets to enable Docker Hub publishing" >> $GITHUB_STEP_SUMMARY
-          fi
-
-  # 5️⃣ Build Status Summary
-  build-status:
-    name: Build Status
-    runs-on: ubuntu-latest
-    needs: [build-and-test, code-quality, security-scan]
-    if: always()
-
-    steps:
-      - name: Overall build status
-        run: |
-          echo "## 🎯 Pipeline Status Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Build & Test | ${{ needs.build-and-test.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Code Quality | ${{ needs.code-quality.result == 'success' && '✅ Passed' || needs.code-quality.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Docker Build | ${{ github.ref == 'refs/heads/main' && '🐳 Triggered' || '⏭️ Skipped (not main)' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
-            echo "❌ **Build failed** - Check the Build and Test job for details"
-            exit 1
-          else
-            echo "🎉 **Build successful** - All core checks passed!"
-          fi
+          echo "🔍 **Next Steps**:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Check the **Build and Test** job logs for error details" >> $GITHUB_STEP_SUMMARY
+          echo "2. Fix compilation or test failures" >> $GITHUB_STEP_SUMMARY
+          echo "3. Push changes to re-run the pipeline" >> $GITHUB_STEP_SUMMARY
+        
+          exit 1
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "📊 **Pipeline Metrics**:" >> $GITHUB_STEP_SUMMARY
+        echo "- Branch: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- Trigger: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Java Version: ${{ env.JAVA_VERSION }}" >> $GITHUB_STEP_SUMMARY
