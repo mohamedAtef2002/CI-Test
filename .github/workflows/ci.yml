@@ -9,10 +9,17 @@ on:
 env:
   JAVA_VERSION: '21'
   MAVEN_OPTS: '-Xmx1024m'
-  REGISTRY: docker.io
+
+# Global permissions for the workflow
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  security-events: write
+  actions: read
 
 jobs:
-  # 1️⃣ Build and Test (Combined for efficiency)
+  # 1️⃣ Build and Test
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
@@ -24,14 +31,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history for SonarCloud
+          fetch-depth: 0
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
-          cache: maven
 
       - name: Cache Maven dependencies
         uses: actions/cache@v4
@@ -40,34 +46,49 @@ jobs:
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2
 
-      - name: Verify Java version
+      - name: Verify Java and Maven setup
         run: |
+          echo "Java version:"
           java -version
-          javac -version
+          echo "Maven version:"
+          mvn --version
           echo "JAVA_HOME: $JAVA_HOME"
 
-      - name: Build with Maven
+      - name: Build project
         run: |
           mvn -B clean compile \
             -Dmaven.compiler.source=${{ env.JAVA_VERSION }} \
             -Dmaven.compiler.target=${{ env.JAVA_VERSION }} \
             -Dmaven.compiler.release=${{ env.JAVA_VERSION }}
 
-      - name: Run tests with coverage
+      - name: Run tests
         run: |
-          mvn -B test jacoco:report \
+          mvn -B test \
             -Dmaven.compiler.source=${{ env.JAVA_VERSION }} \
             -Dmaven.compiler.target=${{ env.JAVA_VERSION }} \
             -Dmaven.compiler.release=${{ env.JAVA_VERSION }}
 
-      - name: Generate test report
-        uses: dorny/test-reporter@v1
-        if: success() || failure()
+      - name: Generate test report and coverage
+        run: |
+          mvn jacoco:report
+
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
         with:
-          name: Maven Tests
-          path: target/surefire-reports/*.xml
-          reporter: java-junit
-          fail-on-error: false
+          files: |
+            target/surefire-reports/*.xml
+
+      - name: Add coverage to PR
+        id: jacoco
+        uses: madrapps/jacoco-report@v1.6.1
+        if: github.event_name == 'pull_request'
+        with:
+          paths: |
+            ${{ github.workspace }}/target/site/jacoco/jacoco.xml
+          token: ${{ secrets.GITHUB_TOKEN }}
+          min-coverage-overall: 70
+          min-coverage-changed-files: 70
 
       - name: Package application
         run: |
@@ -81,79 +102,29 @@ jobs:
         run: |
           VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
+          echo "📦 Version: $VERSION"
 
-      - name: Upload JAR artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: jar-artifact
-          path: target/*.jar
-          retention-days: 1
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results
+          name: build-artifacts
           path: |
-            target/surefire-reports/
+            target/*.jar
             target/site/jacoco/
-          retention-days: 30
+          retention-days: 7
 
-  # 2️⃣ Security Scan
-  security-scan:
-    name: Security Analysis
-    runs-on: ubuntu-latest
-    needs: build-and-test
-    permissions:
-      security-events: write
-      contents: read
-      actions: read
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          java-version: ${{ env.JAVA_VERSION }}
-          distribution: 'temurin'
-          cache: maven
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: java
-          queries: security-extended,security-and-quality
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-        env:
-          MAVEN_OPTS: '-Dmaven.compiler.source=${{ env.JAVA_VERSION }} -Dmaven.compiler.target=${{ env.JAVA_VERSION }}'
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:java"
-
-      - name: Trivy FS Scan (Dependencies)
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-fs-results.sarif'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-          ignore-unfixed: true
-
-      - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@v3
+      - name: Display test summary
         if: always()
-        with:
-          sarif_file: 'trivy-fs-results.sarif'
+        run: |
+          echo "## Test Summary 📊" >> $GITHUB_STEP_SUMMARY
+          if [ -f target/surefire-reports/TEST-*.xml ]; then
+            echo "✅ Test reports generated successfully" >> $GITHUB_STEP_SUMMARY
+            echo "📁 Reports location: target/surefire-reports/" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ No test reports found" >> $GITHUB_STEP_SUMMARY
+          fi
 
-  # 3️⃣ Code Quality Analysis
+  # 2️⃣ Code Quality Analysis
   code-quality:
     name: Code Quality
     runs-on: ubuntu-latest
@@ -171,7 +142,12 @@ jobs:
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
-          cache: maven
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
 
       - name: Cache SonarCloud packages
         uses: actions/cache@v4
@@ -180,25 +156,77 @@ jobs:
           key: ${{ runner.os }}-sonar
           restore-keys: ${{ runner.os }}-sonar
 
-      - name: Download test results
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: test-results
+          name: build-artifacts
           path: target/
 
-      - name: SonarCloud analysis
+      - name: Run SonarCloud analysis
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          mvn -B verify sonar:sonar \
-            -Dmaven.compiler.source=${{ env.JAVA_VERSION }} \
-            -Dmaven.compiler.target=${{ env.JAVA_VERSION }} \
-            -Dmaven.compiler.release=${{ env.JAVA_VERSION }} \
-            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }} \
-            -Dsonar.organization=${{ github.repository_owner }} \
-            -Dsonar.host.url=https://sonarcloud.io \
-            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "⚠️ SONAR_TOKEN not set, skipping SonarCloud analysis"
+            echo "To enable SonarCloud, set SONAR_TOKEN in repository secrets"
+          else
+            mvn -B verify sonar:sonar \
+              -Dmaven.compiler.source=${{ env.JAVA_VERSION }} \
+              -Dmaven.compiler.target=${{ env.JAVA_VERSION }} \
+              -Dmaven.compiler.release=${{ env.JAVA_VERSION }} \
+              -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }} \
+              -Dsonar.organization=${{ github.repository_owner }} \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+          fi
+
+  # 3️⃣ Security Scan
+  security-scan:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+        env:
+          MAVEN_OPTS: '-Dmaven.compiler.source=${{ env.JAVA_VERSION }} -Dmaven.compiler.target=${{ env.JAVA_VERSION }}'
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:java"
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
 
   # 4️⃣ Docker Build and Push
   docker:
@@ -207,25 +235,21 @@ jobs:
     needs: [build-and-test, security-scan, code-quality]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
-    permissions:
-      contents: read
-      packages: write
-      security-events: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download JAR artifact
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: jar-artifact
+          name: build-artifacts
           path: target/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -238,7 +262,6 @@ jobs:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/myapp
           tags: |
             type=ref,event=branch
-            type=ref,event=pr
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ needs.build-and-test.outputs.version }}
 
@@ -247,40 +270,29 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            JAR_FILE=target/*.jar
 
-      - name: Trivy Image Scan
+      - name: Run Trivy vulnerability scanner on image
+        if: github.event_name != 'pull_request'
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/myapp:latest
           format: 'sarif'
           output: 'trivy-image-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          ignore-unfixed: true
 
       - name: Upload Trivy image scan results
+        if: github.event_name != 'pull_request'
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
         with:
           sarif_file: 'trivy-image-results.sarif'
 
-  # 5️⃣ Deployment (Optional - only on main branch)
-  deploy:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: docker
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    environment: staging
-
-    steps:
-      - name: Deploy notification
+      - name: Image build summary
         run: |
-          echo "🚀 Deploying version ${{ needs.build-and-test.outputs.version }} to staging"
-          # Add your deployment steps here
-          # Example: kubectl apply, helm upgrade, etc.
+          echo "## Docker Build Summary 🐳" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ secrets.DOCKERHUB_USERNAME }}/myapp:${{ needs.build-and-test.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platforms**: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "- **Push**: ${{ github.event_name != 'pull_request' }}" >> $GITHUB_STEP_SUMMARY
