@@ -220,8 +220,8 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
           echo "🔍 Running SonarCloud analysis..."
-          echo "Project Key: ${{ steps.sonar-validate.outputs.project_key }}"
-          echo "Organization: ${{ steps.sonar-validate.outputs.organization }}"
+          echo "Project Key: mohamedAtef2002_CI-Test"
+          echo "Organization: mohamedatef2002"
           
           mvn -B sonar:sonar \
             -Dmaven.project.sourceRoots.warningsDisabled=true \
