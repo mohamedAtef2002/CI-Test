@@ -187,18 +187,51 @@ jobs:
             echo "⚠️ SonarCloud token not found - running basic analysis instead"
           fi
 
-      - name: Run SonarCloud analysis
+      - name: Validate SonarCloud project setup
         if: steps.sonar-check.outputs.sonar_enabled == 'true'
+        id: sonar-validate
+        run: |
+          # Check if required environment variables are set
+          if [ -z "${{ secrets.SONAR_TOKEN }}" ]; then
+            echo "sonar_valid=false" >> $GITHUB_OUTPUT
+            echo "❌ SONAR_TOKEN is not set"
+            exit 0
+          fi
+          
+          # Extract repository info
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          
+          echo "Repository Owner: $REPO_OWNER"
+          echo "Repository Name: $REPO_NAME"
+          
+          # Check if this is a valid project key format
+          PROJECT_KEY="${REPO_OWNER}_${REPO_NAME}"
+          echo "Generated Project Key: $PROJECT_KEY"
+          
+          echo "sonar_valid=true" >> $GITHUB_OUTPUT
+          echo "project_key=$PROJECT_KEY" >> $GITHUB_OUTPUT
+          echo "organization=$REPO_OWNER" >> $GITHUB_OUTPUT
+
+      - name: Run SonarCloud analysis
+        if: steps.sonar-check.outputs.sonar_enabled == 'true' && steps.sonar-validate.outputs.sonar_valid == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
+          echo "🔍 Running SonarCloud analysis..."
+          echo "Project Key: ${{ steps.sonar-validate.outputs.project_key }}"
+          echo "Organization: ${{ steps.sonar-validate.outputs.organization }}"
+          
           mvn -B sonar:sonar \
             -Dmaven.project.sourceRoots.warningsDisabled=true \
-            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }} \
-            -Dsonar.organization=${{ github.repository_owner }} \
+            -Dsonar.projectKey=${{ steps.sonar-validate.outputs.project_key }} \
+            -Dsonar.organization=${{ steps.sonar-validate.outputs.organization }} \
             -Dsonar.host.url=https://sonarcloud.io \
-            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.java.source=${{ env.JAVA_VERSION }} \
+            -Dsonar.java.target=${{ env.JAVA_VERSION }}
+        continue-on-error: true
 
       - name: Run basic code analysis
         if: steps.sonar-check.outputs.sonar_enabled == 'false'
@@ -229,6 +262,12 @@ jobs:
           
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "💡 **Tip**: Add SONAR_TOKEN to repository secrets for detailed code quality analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### To set up SonarCloud:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Go to https://sonarcloud.io" >> $GITHUB_STEP_SUMMARY
+          echo "2. Sign in with GitHub" >> $GITHUB_STEP_SUMMARY
+          echo "3. Import this repository" >> $GITHUB_STEP_SUMMARY
+          echo "4. Generate a token and add it as SONAR_TOKEN secret" >> $GITHUB_STEP_SUMMARY
           
           echo "✅ Basic code analysis completed"
 
@@ -309,10 +348,23 @@ jobs:
           name: build-artifacts
           path: target/
 
+      - name: Verify Dockerfile exists
+        id: dockerfile-check
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "dockerfile_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Dockerfile found"
+          else
+            echo "dockerfile_exists=false" >> $GITHUB_OUTPUT
+            echo "❌ Dockerfile not found - skipping Docker build"
+          fi
+
       - name: Set up Docker Buildx
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Check Docker Hub credentials
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         id: docker-check
         run: |
           if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
@@ -324,13 +376,14 @@ jobs:
           fi
 
       - name: Log in to Docker Hub
-        if: steps.docker-check.outputs.docker_enabled == 'true'
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true' && steps.docker-check.outputs.docker_enabled == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -341,6 +394,7 @@ jobs:
             type=raw,value=${{ needs.build-and-test.outputs.version }}
 
       - name: Build Docker image
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -352,6 +406,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Test Docker image
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true'
         run: |
           echo "🧪 Testing Docker image..."
           IMAGE_NAME="${{ secrets.DOCKERHUB_USERNAME || 'local' }}/myapp:latest"
@@ -361,7 +416,7 @@ jobs:
           timeout 10 docker run --rm $IMAGE_NAME || echo "Image test completed (expected to exit)"
 
       - name: Push Docker image
-        if: steps.docker-check.outputs.docker_enabled == 'true'
+        if: steps.dockerfile-check.outputs.dockerfile_exists == 'true' && steps.docker-check.outputs.docker_enabled == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -376,13 +431,24 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Built | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
-          echo "| Pushed to Registry | ${{ steps.docker-check.outputs.docker_enabled == 'true' && '✅ Yes' || '⚠️ Local only' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Platforms | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
-          echo "| Version | ${{ needs.build-and-test.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.dockerfile-check.outputs.dockerfile_exists }}" == "true" ]; then
+            echo "| Dockerfile | ✅ Found |" >> $GITHUB_STEP_SUMMARY
+            echo "| Image Built | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
+            echo "| Pushed to Registry | ${{ steps.docker-check.outputs.docker_enabled == 'true' && '✅ Yes' || '⚠️ Local only' }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Platforms | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
+            echo "| Version | ${{ needs.build-and-test.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Dockerfile | ❌ Missing |" >> $GITHUB_STEP_SUMMARY
+            echo "| Image Built | ❌ Skipped |" >> $GITHUB_STEP_SUMMARY
+            echo "| Status | ⚠️ Add Dockerfile to enable Docker builds |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ steps.docker-check.outputs.docker_enabled }}" != "true" ]; then
+          if [ "${{ steps.dockerfile-check.outputs.dockerfile_exists }}" != "true" ]; then
+            echo "💡 **Tip**: Add a Dockerfile to the repository root to enable Docker builds" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.docker-check.outputs.docker_enabled }}" != "true" ]; then
             echo "💡 **Tip**: Add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN to repository secrets to enable Docker Hub publishing" >> $GITHUB_STEP_SUMMARY
           fi
 
