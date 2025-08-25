@@ -144,7 +144,7 @@ jobs:
           echo "### 📁 Artifacts Generated:" >> $GITHUB_STEP_SUMMARY
           ls -la target/ >> $GITHUB_STEP_SUMMARY || true
 
-  # 2️⃣ Code Quality Analysis (Optional)
+  # 2️⃣ Code Quality Analysis (Improved SonarCloud handling)
   code-quality:
     name: Code Quality
     runs-on: ubuntu-latest
@@ -187,34 +187,42 @@ jobs:
             echo "⚠️ SonarCloud token not found - running basic analysis instead"
           fi
 
-      - name: Validate SonarCloud project setup
+      - name: Setup SonarCloud configuration
         if: steps.sonar-check.outputs.sonar_enabled == 'true'
-        id: sonar-validate
+        id: sonar-setup
         run: |
-          # Check if required environment variables are set
-          if [ -z "${{ secrets.SONAR_TOKEN }}" ]; then
-            echo "sonar_valid=false" >> $GITHUB_OUTPUT
-            echo "❌ SONAR_TOKEN is not set"
-            exit 0
-          fi
-          
-          # Extract repository info
+          # Extract repository information
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
+          REPO_FULL="${{ github.repository }}"
           
           echo "Repository Owner: $REPO_OWNER"
           echo "Repository Name: $REPO_NAME"
+          echo "Full Repository: $REPO_FULL"
           
-          # Check if this is a valid project key format
-          PROJECT_KEY="${REPO_OWNER}_${REPO_NAME}"
-          echo "Generated Project Key: $PROJECT_KEY"
+          # Try different project key formats (most common SonarCloud patterns)
+          # Format 1: GitHub repository format (owner/repo) - most common
+          PROJECT_KEY_1="$REPO_FULL"
+          # Format 2: Underscore format (owner_repo)
+          PROJECT_KEY_2="${REPO_OWNER}_${REPO_NAME}"
+          # Format 3: Simple repo name
+          PROJECT_KEY_3="$REPO_NAME"
           
-          echo "sonar_valid=true" >> $GITHUB_OUTPUT
-          echo "project_key=$PROJECT_KEY" >> $GITHUB_OUTPUT
+          echo "Possible project keys:"
+          echo "  1. $PROJECT_KEY_1 (GitHub format - recommended)"
+          echo "  2. $PROJECT_KEY_2 (Underscore format)"
+          echo "  3. $PROJECT_KEY_3 (Simple name)"
+          
+          # Use GitHub repository format as default (most common in SonarCloud)
+          echo "project_key=$PROJECT_KEY_1" >> $GITHUB_OUTPUT
           echo "organization=$REPO_OWNER" >> $GITHUB_OUTPUT
+          
+          echo "Using:"
+          echo "  Project Key: $PROJECT_KEY_1"
+          echo "  Organization: $REPO_OWNER"
 
       - name: Run SonarCloud analysis
-        if: steps.sonar-check.outputs.sonar_enabled == 'true' && steps.sonar-validate.outputs.sonar_valid == 'true'
+        if: steps.sonar-check.outputs.sonar_enabled == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -223,18 +231,47 @@ jobs:
           echo "Project Key: mohamedAtef2002_CI-Test"
           echo "Organization: mohamedatef2002"
           
+          # Run SonarCloud analysis with better error handling
+          set +e  # Don't exit on error
           mvn -B sonar:sonar \
             -Dmaven.project.sourceRoots.warningsDisabled=true \
-            -Dsonar.projectKey=${{ steps.sonar-validate.outputs.project_key }} \
-            -Dsonar.organization=${{ steps.sonar-validate.outputs.organization }} \
+            -Dsonar.projectKey="${{ steps.sonar-setup.outputs.project_key }}" \
+            -Dsonar.organization="${{ steps.sonar-setup.outputs.organization }}" \
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
             -Dsonar.java.source=${{ env.JAVA_VERSION }} \
-            -Dsonar.java.target=${{ env.JAVA_VERSION }}
-        continue-on-error: true
+            -Dsonar.java.target=${{ env.JAVA_VERSION }} \
+            -Dsonar.verbose=true
+          
+          SONAR_EXIT_CODE=$?
+          set -e  # Re-enable exit on error
+          
+          if [ $SONAR_EXIT_CODE -eq 0 ]; then
+            echo "✅ SonarCloud analysis completed successfully"
+            echo "sonar_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ SonarCloud analysis failed (exit code: $SONAR_EXIT_CODE)"
+            echo "sonar_success=false" >> $GITHUB_OUTPUT
+          
+            echo "## ⚠️ SonarCloud Setup Required" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The SonarCloud analysis failed. This usually means the project doesn't exist in SonarCloud yet." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Quick Setup Steps:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Go to [SonarCloud.io](https://sonarcloud.io)" >> $GITHUB_STEP_SUMMARY
+            echo "2. Sign in with your GitHub account" >> $GITHUB_STEP_SUMMARY
+            echo "3. Click '+' → 'Analyze new project'" >> $GITHUB_STEP_SUMMARY
+            echo "4. Select your GitHub organization: \`${{ steps.sonar-setup.outputs.organization }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "5. Choose this repository: \`${{ github.event.repository.name }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "6. Generate a token and add it as \`SONAR_TOKEN\` secret in GitHub" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Expected Project Key**: \`${{ steps.sonar-setup.outputs.project_key }}\`" >> $GITHUB_STEP_SUMMARY
+          
+            # Don't fail the job, just continue with basic analysis
+          fi
 
       - name: Run basic code analysis
-        if: steps.sonar-check.outputs.sonar_enabled == 'false'
+        if: steps.sonar-check.outputs.sonar_enabled == 'false' || (steps.sonar-check.outputs.sonar_enabled == 'true' && steps.sonar-validate.outputs.sonar_success != 'true')
         run: |
           echo "🔍 Running basic code analysis..."
           
@@ -254,20 +291,19 @@ jobs:
           
           # Check if coverage report exists
           if [ -f target/site/jacoco/jacoco.xml ]; then
-            COVERAGE=$(grep -o 'missed="[0-9]*"' target/site/jacoco/jacoco.xml | head -1 | grep -o '[0-9]*' || echo "N/A")
-            echo "| Coverage Data | Available |" >> $GITHUB_STEP_SUMMARY
+            echo "| Coverage Data | ✅ Available |" >> $GITHUB_STEP_SUMMARY
           else
-            echo "| Coverage Data | Not Available |" >> $GITHUB_STEP_SUMMARY
+            echo "| Coverage Data | ❌ Not Available |" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "💡 **Tip**: Add SONAR_TOKEN to repository secrets for detailed code quality analysis" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### To set up SonarCloud:" >> $GITHUB_STEP_SUMMARY
-          echo "1. Go to https://sonarcloud.io" >> $GITHUB_STEP_SUMMARY
-          echo "2. Sign in with GitHub" >> $GITHUB_STEP_SUMMARY
-          echo "3. Import this repository" >> $GITHUB_STEP_SUMMARY
-          echo "4. Generate a token and add it as SONAR_TOKEN secret" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.sonar-check.outputs.sonar_enabled }}" == "false" ]; then
+            echo "💡 **Setup SonarCloud for detailed analysis:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. Visit [sonarcloud.io](https://sonarcloud.io)" >> $GITHUB_STEP_SUMMARY
+            echo "2. Import this repository" >> $GITHUB_STEP_SUMMARY
+            echo "3. Add \`SONAR_TOKEN\` to repository secrets" >> $GITHUB_STEP_SUMMARY
+          fi
           
           echo "✅ Basic code analysis completed"
 
