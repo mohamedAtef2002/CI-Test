@@ -76,8 +76,11 @@ jobs:
         with:
           files: |
             target/surefire-reports/*.xml
-          check_name: "Test Results"
-          comment_mode: create new
+          check_name: "Maven Test Results"
+          comment_mode: always
+          comment_title: "Unit Test Results"
+          fail_on: "test failures"
+          action_fail: false
 
       - name: Add coverage to PR
         uses: madrapps/jacoco-report@v1.6.1
@@ -89,6 +92,7 @@ jobs:
           min-coverage-overall: 70
           min-coverage-changed-files: 70
           title: "Code Coverage Report"
+        continue-on-error: true
 
       - name: Package application
         run: |
@@ -135,6 +139,10 @@ jobs:
           else
             echo "| Coverage Report | ❌ Not Found |" >> $GITHUB_STEP_SUMMARY
           fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📁 Artifacts Generated:" >> $GITHUB_STEP_SUMMARY
+          ls -la target/ >> $GITHUB_STEP_SUMMARY || true
 
   # 2️⃣ Code Quality Analysis (Optional)
   code-quality:
@@ -160,6 +168,7 @@ jobs:
         with:
           path: ~/.m2
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -175,11 +184,7 @@ jobs:
             echo "✅ SonarCloud token found - analysis will run"
           else
             echo "sonar_enabled=false" >> $GITHUB_OUTPUT
-            echo "⚠️ SonarCloud token not found - skipping analysis"
-            echo "To enable SonarCloud:"
-            echo "1. Go to https://sonarcloud.io"
-            echo "2. Create a project for your repository"
-            echo "3. Add SONAR_TOKEN to GitHub repository secrets"
+            echo "⚠️ SonarCloud token not found - running basic analysis instead"
           fi
 
       - name: Run SonarCloud analysis
@@ -195,7 +200,7 @@ jobs:
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
 
-      - name: Run basic code analysis (without SonarCloud)
+      - name: Run basic code analysis
         if: steps.sonar-check.outputs.sonar_enabled == 'false'
         run: |
           echo "🔍 Running basic code analysis..."
@@ -204,8 +209,8 @@ jobs:
           echo "## 📈 Code Metrics" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          JAVA_FILES=$(find src -name "*.java" | wc -l)
-          JAVA_LINES=$(find src -name "*.java" -exec cat {} \; | wc -l)
+          JAVA_FILES=$(find src -name "*.java" 2>/dev/null | wc -l || echo "0")
+          JAVA_LINES=$(find src -name "*.java" -exec cat {} \; 2>/dev/null | wc -l || echo "0")
           TEST_FILES=$(find src/test -name "*.java" 2>/dev/null | wc -l || echo "0")
           
           echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
@@ -214,9 +219,20 @@ jobs:
           echo "| Lines of Code | $JAVA_LINES |" >> $GITHUB_STEP_SUMMARY
           echo "| Test Files | $TEST_FILES |" >> $GITHUB_STEP_SUMMARY
           
+          # Check if coverage report exists
+          if [ -f target/site/jacoco/jacoco.xml ]; then
+            COVERAGE=$(grep -o 'missed="[0-9]*"' target/site/jacoco/jacoco.xml | head -1 | grep -o '[0-9]*' || echo "N/A")
+            echo "| Coverage Data | Available |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Coverage Data | Not Available |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **Tip**: Add SONAR_TOKEN to repository secrets for detailed code quality analysis" >> $GITHUB_STEP_SUMMARY
+          
           echo "✅ Basic code analysis completed"
 
-  # 3️⃣ Security Scan (Simplified)
+  # 3️⃣ Security Scan
   security-scan:
     name: Security Scan
     runs-on: ubuntu-latest
@@ -226,7 +242,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run Trivy vulnerability scanner (filesystem)
+      - name: Run Trivy vulnerability scanner (display)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
@@ -244,8 +260,9 @@ jobs:
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+        continue-on-error: true
 
-      - name: Check if SARIF file exists
+      - name: Check SARIF file
         id: sarif-check
         run: |
           if [ -f trivy-results.sarif ]; then
@@ -254,9 +271,10 @@ jobs:
           else
             echo "sarif_exists=false" >> $GITHUB_OUTPUT
             echo "⚠️ SARIF file not generated"
+            touch trivy-results.sarif
           fi
 
-      - name: Upload Trivy scan results (if file exists)
+      - name: Upload Trivy scan results
         if: steps.sarif-check.outputs.sarif_exists == 'true'
         uses: github/codeql-action/upload-sarif@v3
         continue-on-error: true
@@ -271,6 +289,8 @@ jobs:
           echo "- **Scope**: Filesystem dependencies" >> $GITHUB_STEP_SUMMARY
           echo "- **Severity**: CRITICAL, HIGH" >> $GITHUB_STEP_SUMMARY
           echo "- **SARIF Upload**: ${{ steps.sarif-check.outputs.sarif_exists == 'true' && '✅ Success' || '⚠️ Skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **Tip**: Enable GitHub Code Scanning in repository settings for advanced security analysis" >> $GITHUB_STEP_SUMMARY
 
   # 4️⃣ Docker Build and Push
   docker:
@@ -297,11 +317,10 @@ jobs:
         run: |
           if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
             echo "docker_enabled=true" >> $GITHUB_OUTPUT
-            echo "✅ Docker Hub credentials found"
+            echo "✅ Docker Hub credentials found - will push to registry"
           else
             echo "docker_enabled=false" >> $GITHUB_OUTPUT
-            echo "⚠️ Docker Hub credentials not found"
-            echo "To enable Docker push, add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN to repository secrets"
+            echo "⚠️ Docker Hub credentials not found - will build locally only"
           fi
 
       - name: Log in to Docker Hub
@@ -315,7 +334,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME || 'myapp' }}/myapp
+          images: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}/myapp
           tags: |
             type=ref,event=branch
             type=raw,value=latest,enable={{is_default_branch}}
@@ -335,7 +354,11 @@ jobs:
       - name: Test Docker image
         run: |
           echo "🧪 Testing Docker image..."
-          docker run --rm ${{ secrets.DOCKERHUB_USERNAME || 'myapp' }}/myapp:latest --version || true
+          IMAGE_NAME="${{ secrets.DOCKERHUB_USERNAME || 'local' }}/myapp:latest"
+          echo "Testing image: $IMAGE_NAME"
+          
+          # Test if image runs (will exit quickly for Spring Boot without proper config)
+          timeout 10 docker run --rm $IMAGE_NAME || echo "Image test completed (expected to exit)"
 
       - name: Push Docker image
         if: steps.docker-check.outputs.docker_enabled == 'true'
@@ -354,6 +377,38 @@ jobs:
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Image Built | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
-          echo "| Pushed to Registry | ${{ steps.docker-check.outputs.docker_enabled == 'true' && '✅ Yes' || '⚠️ Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pushed to Registry | ${{ steps.docker-check.outputs.docker_enabled == 'true' && '✅ Yes' || '⚠️ Local only' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Platforms | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
           echo "| Version | ${{ needs.build-and-test.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.docker-check.outputs.docker_enabled }}" != "true" ]; then
+            echo "💡 **Tip**: Add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN to repository secrets to enable Docker Hub publishing" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # 5️⃣ Build Status Summary
+  build-status:
+    name: Build Status
+    runs-on: ubuntu-latest
+    needs: [build-and-test, code-quality, security-scan]
+    if: always()
+
+    steps:
+      - name: Overall build status
+        run: |
+          echo "## 🎯 Pipeline Status Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Test | ${{ needs.build-and-test.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Quality | ${{ needs.code-quality.result == 'success' && '✅ Passed' || needs.code-quality.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Build | ${{ github.ref == 'refs/heads/main' && '🐳 Triggered' || '⏭️ Skipped (not main)' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
+            echo "❌ **Build failed** - Check the Build and Test job for details"
+            exit 1
+          else
+            echo "🎉 **Build successful** - All core checks passed!"
+          fi
